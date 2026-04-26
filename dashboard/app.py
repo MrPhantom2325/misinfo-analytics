@@ -17,6 +17,7 @@ Reads from SQLite DB written by Spark streaming jobs via storage.py.
 import os
 import sys
 import logging
+import sqlite3
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -408,14 +409,36 @@ def cb_velocity(_):
 def cb_domains(_):
     df = storage.get_top_risky_domains(top_n=10, db_path=DB_PATH)
     if df.empty:
-        return empty_fig()
+        try:
+            con = sqlite3.connect(DB_PATH)
+            df = pd.read_sql_query(
+                """
+                SELECT source_domain,
+                       SUM(article_count)    AS total_articles,
+                       AVG(avg_credibility)  AS avg_credibility,
+                       MIN(min_credibility)  AS min_credibility,
+                       SUM(total_velocity)    AS total_velocity,
+                       MAX(risk_score)        AS peak_risk_score,
+                       AVG(risk_score)        AS avg_risk_score
+                FROM domain_risk
+                GROUP BY source_domain
+                ORDER BY avg_risk_score DESC
+                LIMIT ?
+                """,
+                con,
+                params=(10,),
+            )
+            con.close()
+        except Exception as exc:
+            log.warning(f"cb_domains fallback query failed: {exc}")
+            return empty_fig()
 
     df = df.copy()
     df["source_domain"] = df["source_domain"].fillna("(unknown)").astype(str)
     df["avg_risk_score"] = pd.to_numeric(df["avg_risk_score"], errors="coerce")
     df["total_articles"] = pd.to_numeric(df["total_articles"], errors="coerce").fillna(0)
-    df["avg_credibility"] = pd.to_numeric(df["avg_credibility"], errors="coerce")
-    df = df[df["avg_risk_score"].notna()]
+    df["avg_credibility"] = pd.to_numeric(df["avg_credibility"], errors="coerce").fillna(0.0)
+    df["avg_risk_score"] = df["avg_risk_score"].fillna(0.0)
     if df.empty:
         return empty_fig("no risk domain data")
 
@@ -435,7 +458,9 @@ def cb_domains(_):
     layout["xaxis"] = dict(**BASE_LAYOUT["xaxis"], title="Risk Score")
     y_tickfont = dict(BASE_LAYOUT["yaxis"].get("tickfont", {}))
     y_tickfont.update({"size": 9, "family": FONT_MONO})
-    layout["yaxis"] = dict(**BASE_LAYOUT["yaxis"], tickfont=y_tickfont)
+    y_axis = dict(BASE_LAYOUT["yaxis"])
+    y_axis["tickfont"] = y_tickfont
+    layout["yaxis"] = y_axis
     layout["margin"] = dict(l=4, r=8, t=8, b=8)
     fig.update_layout(**layout)
     return fig
