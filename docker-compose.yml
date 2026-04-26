@@ -1,0 +1,211 @@
+version: "3.8"
+
+services:
+  # ─────────────────────────────────────────────
+  # Zookeeper – Kafka coordination service
+  # ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: misinfo-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - misinfo-net
+
+  # ─────────────────────────────────────────────
+  # Kafka Broker
+  # ─────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: misinfo-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092" # Host access
+      - "29092:29092" # Internal Docker network access
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - misinfo-net
+
+  # ─────────────────────────────────────────────
+  # Kafka Topic Initializer
+  # Creates all required topics on startup
+  # ─────────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: misinfo-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      echo 'Waiting for Kafka to be ready...'
+      sleep 5
+
+      echo 'Creating Kafka topics...'
+
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic raw-articles --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic flagged-misinfo --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic geo-spread --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic viral-alerts --partitions 3 --replication-factor 1
+
+      echo 'All topics created successfully:'
+      kafka-topics --bootstrap-server kafka:29092 --list
+    networks:
+      - misinfo-net
+
+  # ─────────────────────────────────────────────
+  # Kafka UI – Web interface to inspect topics
+  # Access: http://localhost:8080
+  # ─────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: misinfo-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: misinfo-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - misinfo-net
+
+  # ─────────────────────────────────────────────
+  # Misinformation Producer
+  # Streams fake articles into raw-articles topic
+  # ─────────────────────────────────────────────
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    container_name: misinfo-producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      PRODUCER_RATE: "50" # messages per second
+      BURST_INTERVAL: "60" # seconds between burst events
+      BURST_MULTIPLIER: "10" # burst rate multiplier
+    networks:
+      - misinfo-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Apache Spark – Streaming analytics engine
+  # ─────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.5
+    container_name: misinfo-spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    ports:
+      - "8090:8080" # Spark Master UI (mapped to 8090 to avoid conflict with Kafka UI)
+      - "7077:7077" # Spark master port
+    networks:
+      - misinfo-net
+
+  spark-worker:
+    image: apache/spark:3.5.5
+    container_name: misinfo-spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    networks:
+      - misinfo-net
+
+  # ─────────────────────────────────────────────
+  # Spark Analytics Jobs (runs all 5 analyzers)
+  # ─────────────────────────────────────────────
+  spark-analyzer:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    container_name: misinfo-spark-analyzer
+    depends_on:
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DB_PATH: /app/data/misinfo.db
+      DATA_DIR: /app/data
+      CHECKPOINT_DIR: /app/data/checkpoints
+      VIRAL_VELOCITY_THRESHOLD: "5000"
+      CREDIBILITY_THRESHOLD: "0.4"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - misinfo-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Plotly Dash Dashboard
+  # Access: http://localhost:8050
+  # ─────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: misinfo-dashboard
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "8050:8050"
+    environment:
+      DATA_DIR: /app/data
+      DB_PATH: /app/data/misinfo.db
+    volumes:
+      - ./data:/app/data
+      - ./spark/storage.py:/app/storage.py # Dashboard imports storage query layer
+    networks:
+      - misinfo-net
+    restart: unless-stopped
+
+networks:
+  misinfo-net:
+    driver: bridge
